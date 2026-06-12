@@ -362,9 +362,12 @@ create() {
             [[ $is_new_dynamic_port_json ]] && jq <<<$is_new_dynamic_port_json && msg
             return
         }
-        [[ $is_change && $is_config_file && -f $is_config_json ]] && {
+        if [[ $is_change && $is_config_file && -f $is_config_json ]]; then
             is_keep_chain_outbound=$(jq -c --arg tag "chain-$is_config_file" '.outbounds[]? | select(.tag == $tag) | del(.tag)' $is_config_json)
-        }
+            is_keep_direct_rule=$(jq -r --arg inbound "$is_config_file" '
+                any(.routing.rules[]?; (.outboundTag == "direct") and ((.inboundTag // []) | if type == "array" then index($inbound) else . == $inbound end))
+            ' $is_config_json)
+        fi
         # del old file
         [[ $is_config_file ]] && is_no_del_msg=1 && del $is_config_file
         # save json to file
@@ -388,6 +391,11 @@ create() {
             is_chain_outbound=$is_keep_chain_outbound
             is_config_file=$is_config_name
             chain_apply_current
+            is_api_fail=1
+        }
+        [[ $is_keep_direct_rule == 'true' ]] && {
+            is_config_file=$is_config_name
+            chain_direct_current
             is_api_fail=1
         }
         # restart core
@@ -923,9 +931,17 @@ chain_update_config() {
 
 chain_clean_current() {
     chain_tag
-    chain_update_config --arg tag "$is_chain_tag" '
+    chain_update_config \
+        --arg tag "$is_chain_tag" \
+        --arg inbound "$is_config_file" \
+        --arg dynamic "${is_current_dynamic_port_tag:-$is_dynamic_port}" '
+        def has_inbound($name):
+            ((.inboundTag // []) | if type == "array" then index($name) != null else . == $name end);
         .outbounds = ((.outbounds // []) | map(select(.tag != $tag))) |
-        .routing.rules = ((.routing.rules // []) | map(select((.outboundTag // "") != $tag)))
+        .routing.rules = ((.routing.rules // []) | map(select(
+            ((.outboundTag // "") != $tag) and
+            (((.outboundTag == "direct") and (has_inbound($inbound) or ($dynamic != "" and has_inbound($dynamic)))) | not)
+        )))
     '
 }
 
@@ -939,11 +955,16 @@ chain_apply_current() {
         --arg tag "$is_chain_tag" \
         --arg inbound "$is_config_file" \
         --arg dynamic "${is_current_dynamic_port_tag:-$is_dynamic_port}" '
+        def has_inbound($name):
+            ((.inboundTag // []) | if type == "array" then index($name) != null else . == $name end);
         ($outbound + {tag:$tag}) as $chain_outbound |
         {type:"field", inboundTag:([$inbound, $dynamic] | map(select(. != ""))), outboundTag:$tag} as $chain_rule |
         .outbounds = ((.outbounds // []) | map(select(.tag != $tag)) + [$chain_outbound]) |
         .routing.rules = (
-            ((.routing.rules // []) | map(select((.outboundTag // "") != $tag))) as $rules |
+            ((.routing.rules // []) | map(select(
+                ((.outboundTag // "") != $tag) and
+                (((.outboundTag == "direct") and (has_inbound($inbound) or ($dynamic != "" and has_inbound($dynamic)))) | not)
+            ))) as $rules |
             if (($rules[0].outboundTag // "") == "api") then
                 [$rules[0], $chain_rule] + ($rules[1:] // [])
             else
@@ -959,6 +980,44 @@ chain_apply_current() {
             warn "链式代理配置测试失败, 已自动恢复原配置."
             [[ -f /tmp/${is_core}-chain-test.log ]] && cat /tmp/${is_core}-chain-test.log
             err "请检查节点链接或上游代理参数."
+        fi
+    fi
+    rm -f $is_chain_backup
+}
+
+chain_direct_current() {
+    chain_tag
+    is_chain_backup=$(mktemp)
+    [[ ! $is_chain_backup ]] && err "无法创建临时文件."
+    cp -f $is_config_json $is_chain_backup
+    chain_update_config \
+        --arg tag "$is_chain_tag" \
+        --arg inbound "$is_config_file" \
+        --arg dynamic "${is_current_dynamic_port_tag:-$is_dynamic_port}" '
+        def has_inbound($name):
+            ((.inboundTag // []) | if type == "array" then index($name) != null else . == $name end);
+        {type:"field", inboundTag:([$inbound, $dynamic] | map(select(. != ""))), outboundTag:"direct"} as $direct_rule |
+        .outbounds = ((.outbounds // []) | map(select(.tag != $tag))) |
+        .routing.rules = (
+            ((.routing.rules // []) | map(select(
+                ((.outboundTag // "") != $tag) and
+                (((.outboundTag == "direct") and (has_inbound($inbound) or ($dynamic != "" and has_inbound($dynamic)))) | not)
+            ))) as $rules |
+            if (($rules[0].outboundTag // "") == "api") then
+                [$rules[0], $direct_rule] + ($rules[1:] // [])
+            else
+                [$direct_rule] + $rules
+            end
+        )
+    '
+    if [[ -x $is_core_bin ]]; then
+        $is_core_bin -test -c $is_config_json -confdir $is_conf_dir &>/tmp/${is_core}-chain-test.log
+        if [[ $? != 0 ]]; then
+            cp -f $is_chain_backup $is_config_json
+            rm -f $is_chain_backup
+            warn "直连配置测试失败, 已自动恢复原配置."
+            [[ -f /tmp/${is_core}-chain-test.log ]] && cat /tmp/${is_core}-chain-test.log
+            err "请检查配置文件."
         fi
     fi
     rm -f $is_chain_backup
@@ -1310,7 +1369,14 @@ chain_del() {
     [[ $1 ]] && get info $1 || get info
     chain_clean_current
     manage restart &
-    _green "\n已删除 $is_config_file 的链式代理.\n"
+    _green "\n已清除 $is_config_file 的单独出口设置.\n"
+}
+
+chain_direct() {
+    [[ $1 ]] && get info $1 || get info
+    chain_direct_current
+    manage restart &
+    _green "\n已设置 $is_config_file 单独直连 (direct).\n"
 }
 
 chain_list() {
@@ -1324,21 +1390,25 @@ chain_list() {
             else
                 ($out.settings.servers[0] // {})
             end;
-        [.routing.rules[]? | select((.outboundTag // "") | startswith("chain-"))] as $rules |
+        [.routing.rules[]? | select(((.outboundTag // "") | startswith("chain-")) or (.outboundTag == "direct" and (.inboundTag? != null)))] as $rules |
         if ($rules | length) == 0 then
             empty
         else
             $rules[] as $rule |
             ([.outbounds[]? | select(.tag == $rule.outboundTag)][0] // {}) as $out |
             (server($out)) as $server |
-            "配置: \((($rule.inboundTag // []) | if type == "array" then join(",") else tostring end))\n上游: \($out.protocol // "unknown") \($server.address // "-"):\($server.port // "-")\nTag: \($rule.outboundTag)\n"
+            if $rule.outboundTag == "direct" then
+                "配置: \((($rule.inboundTag // []) | if type == "array" then join(",") else tostring end))\n出口: direct\n"
+            else
+                "配置: \((($rule.inboundTag // []) | if type == "array" then join(",") else tostring end))\n出口: \($out.protocol // "unknown") \($server.address // "-"):\($server.port // "-")\nTag: \($rule.outboundTag)\n"
+            end
         end
     ' $is_config_json)
-    [[ $is_chain_list ]] && msg "\n$is_chain_list" || msg "\n当前没有链式代理配置.\n"
+    [[ $is_chain_list ]] && msg "\n$is_chain_list" || msg "\n当前没有单独出口设置.\n"
 }
 
 chain_menu() {
-    is_tmp_list=("导入节点链接" "手动设置链式代理" "查看链式代理" "删除链式代理")
+    is_tmp_list=("导入节点链接" "手动设置链式代理" "设置直连 direct" "查看出口设置" "清除单独设置")
     ask list is_chain_do null "\n请选择链式代理操作:\n"
     case $REPLY in
     1)
@@ -1348,9 +1418,12 @@ chain_menu() {
         chain_set
         ;;
     3)
-        chain_list
+        chain_direct
         ;;
     4)
+        chain_list
+        ;;
+    5)
         chain_del
         ;;
     esac
@@ -1366,6 +1439,9 @@ chain() {
         ;;
     del | delete | rm | none | off)
         chain_del $2
+        ;;
+    direct | freedom)
+        chain_direct $2
         ;;
     import)
         chain_import ${@:2}
